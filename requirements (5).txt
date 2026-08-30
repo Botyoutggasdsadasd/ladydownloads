@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0
+yt-dlp>=2024.7.1
+requests>=2.31.0
+Pillow>=10.0.0
+# sqlite3 is in the Python standard library (no separate install needed)

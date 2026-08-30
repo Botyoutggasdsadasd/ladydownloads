@@ -1,0 +1,472 @@
+diff --git a/admin_bot.py b/admin_bot.py
+index 6ee9340..3b608fa 100644
+--- a/admin_bot.py
++++ b/admin_bot.py
+@@ -245,10 +245,10 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+ 
+ def main():
+     db.init_db()
+-    if config.ADMIN_BOT_TOKEN == "PUT_ADMIN_BOT_TOKEN_HERE":
+-        raise SystemExit("Set ADMIN_BOT_TOKEN env var first.")
++    if not config.ADMIN_BOT_TOKEN:
++        raise SystemExit("Set the ADMIN_BOT_TOKEN env var first.")
+     if not config.ADMIN_IDS:
+-        raise SystemExit("Set ADMIN_IDS env var (your numeric Telegram id) first.")
++        raise SystemExit("Set the ADMIN_IDS env var (your numeric Telegram id) first.")
+ 
+     app = ApplicationBuilder().token(config.ADMIN_BOT_TOKEN).build()
+     app.add_handler(CommandHandler("start", start))
+diff --git a/config.py b/config.py
+index 94c925f..1826a7b 100644
+--- a/config.py
++++ b/config.py
+@@ -1,12 +1,17 @@
+ import os
+ 
+ # --- Bot tokens (create two bots with @BotFather) ---
+-DOWNLOAD_BOT_TOKEN = os.environ.get("DOWNLOAD_BOT_TOKEN", "8798971648:AAFaPeliozXliAo3FvLhtZ3sxdRn1eLeRpw")
+-ADMIN_BOT_TOKEN = os.environ.get("ADMIN_BOT_TOKEN", "8647632292:AAF7lPz9nQsqaPadb1b1cLCi94mlsYQHkOI")
++# SECURITY: no hardcoded fallback values here on purpose. A fallback baked into
++# the source means anyone who reads this public repo has your live token. Set
++# these as real environment variables (Railway Variables tab, systemd
++# EnvironmentFile, etc). The bot refuses to start if they're missing — see
++# the checks in download_bot.py / admin_bot.py main().
++DOWNLOAD_BOT_TOKEN = os.environ.get("DOWNLOAD_BOT_TOKEN", "")
++ADMIN_BOT_TOKEN = os.environ.get("ADMIN_BOT_TOKEN", "")
+ 
+ # Your personal Telegram numeric ID(s) - the only people allowed to use the admin bot.
+-# Get your ID by messaging @userinfobot on Telegram.
+-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6594079594").split(",") if x.strip()]
++# Get your ID by messaging @userinfobot on Telegram. Comma-separate for multiple admins.
++ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+ 
+ # On Railway, set DB_PATH and QR_DIR to paths inside your mounted Volume
+ # (e.g. /data/bot.db and /data/qr_codes) so they survive redeploys.
+@@ -23,6 +28,31 @@ COOKIES_PATH = os.environ.get(
+ 
+ MAX_FILE_MB = 49  # Telegram bot upload limit
+ 
++# --- Scaling / reliability knobs ---
++# Caps how many yt-dlp downloads can run at the same time across all users.
++# yt-dlp + ffmpeg are CPU/bandwidth heavy; without a cap, a burst of users
++# (e.g. a link going viral in a group) can pile up processes and take the
++# whole VPS down. Tune based on your server's CPU cores / RAM.
++MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "4"))
++
++# How long a single yt-dlp extraction+download is allowed to run before it's
++# killed and reported to the user as failed, instead of hanging forever and
++# holding a concurrency slot.
++DOWNLOAD_TIMEOUT_SECONDS = int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "180"))
++
++# How many download attempts (with a short backoff) before giving up. Helps
++# with transient TikTok/YouTube throttling instead of failing on one hiccup.
++DOWNLOAD_MAX_RETRIES = int(os.environ.get("DOWNLOAD_MAX_RETRIES", "2"))
++
++# Telegram allows up to 10 items per media group (album).
++MAX_MEDIA_GROUP_SIZE = 10
++
++# Lightweight, non-AI photo enhancement (sharpen + mild upscale via Pillow).
++# This is NOT AI super-resolution — see README for the real-ESRGAN note if
++# you want true AI upscaling later (needs a GPU-capable server).
++ENABLE_PHOTO_ENHANCE = os.environ.get("ENABLE_PHOTO_ENHANCE", "true").lower() == "true"
++PHOTO_ENHANCE_SCALE = float(os.environ.get("PHOTO_ENHANCE_SCALE", "1.5"))  # upscale factor
++
+ # --- Subscription tiers ---
+ # max_height controls which video qualities a tier is allowed to pick.
+ # price is in USD/month, shown to the user during /upgrade.
+diff --git a/download_bot.py b/download_bot.py
+index 0946be6..a49cfac 100644
+--- a/download_bot.py
++++ b/download_bot.py
+@@ -1,14 +1,18 @@
+ import os
+ import re
++import json
+ import logging
+ import asyncio
+ from tempfile import TemporaryDirectory
+ 
++import requests
+ import yt_dlp
++from PIL import Image, ImageEnhance
+ from telegram import (
+     Update,
+     InlineKeyboardButton,
+     InlineKeyboardMarkup,
++    InputMediaPhoto,
+     Message,
+     Bot,
+ )
+@@ -31,13 +35,145 @@ logging.basicConfig(
+ logger = logging.getLogger(__name__)
+ 
+ URL_REGEX = re.compile(r"https?://\S+")
++TIKTOK_HOST_RE = re.compile(r"tiktok\.com", re.I)
+ 
+ # in-memory session state per chat
+-pending_urls = {}       # chat_id -> url waiting for a quality choice
++pending_urls = {}        # chat_id -> url waiting for a quality choice
++pending_photo_urls = {}  # chat_id -> (post_url, [photo_urls], owner_user_id) waiting for enhance choice
+ awaiting_proof = {}      # chat_id -> tier_requested (waiting for a payment screenshot)
+ 
+ HEIGHT_BY_KEY = {k: h for k, h, _ in config.QUALITY_OPTIONS}
+ 
++# Reused across the whole process instead of building a new Bot() per payment
++# screenshot — cheaper and avoids opening a fresh HTTP client every time.
++_admin_notify_bot = Bot(token=config.ADMIN_BOT_TOKEN) if config.ADMIN_BOT_TOKEN else None
++
++# Caps how many yt-dlp/photo downloads run at once across all users, so a burst
++# of traffic can't pile up processes and take the server down.
++_download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
++
++_SCRAPE_UA = (
++    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
++)
++
++
++async def run_limited(func, *args):
++    """Run a blocking function in a thread, capped by the global download
++    semaphore (config.MAX_CONCURRENT_DOWNLOADS) and bounded by a timeout
++    (config.DOWNLOAD_TIMEOUT_SECONDS) so one stuck request can't hang forever
++    or let unlimited downloads pile up and overload the server."""
++    async with _download_semaphore:
++        loop = asyncio.get_event_loop()
++        return await asyncio.wait_for(
++            loop.run_in_executor(None, func, *args),
++            timeout=config.DOWNLOAD_TIMEOUT_SECONDS,
++        )
++
++
++async def run_limited_with_retry(func, *args):
++    """Same as run_limited, but retries transient failures (network hiccups,
++    throttling) a couple of times with backoff. Timeouts are not retried —
++    if it was already slow once, retrying just burns another concurrency slot."""
++    last_exc = None
++    for attempt in range(config.DOWNLOAD_MAX_RETRIES + 1):
++        try:
++            return await run_limited(func, *args)
++        except asyncio.TimeoutError:
++            raise
++        except Exception as e:  # noqa: BLE001 - genuinely want to catch+retry anything here
++            last_exc = e
++            if attempt < config.DOWNLOAD_MAX_RETRIES:
++                await asyncio.sleep(2 * (attempt + 1))
++                continue
++    raise last_exc
++
++
++def fetch_tiktok_photo_urls(url: str):
++    """Best-effort extraction of individual photo URLs from a TikTok
++    photo-mode (slideshow) post.
++
++    yt-dlp does not currently expose these as separate images for TikTok —
++    it only pulls the slideshow's background audio track and a couple of
++    cover thumbnails — so this scrapes TikTok's own embedded page JSON
++    (the `__UNIVERSAL_DATA_FOR_REHYDRATION__` script tag) directly.
++
++    Returns a list of image URLs (highest quality first per photo) if this
++    is a photo post, or None if it isn't one, or if TikTok has changed its
++    page structure and parsing fails — callers should fall back to the
++    normal yt-dlp video/audio flow when this returns None. Because this
++    depends on TikTok's unofficial page structure, it can break if they
++    change it; that's expected to surface as a clean fallback, not a crash.
++    """
++    try:
++        resp = requests.get(
++            url, headers={"User-Agent": _SCRAPE_UA}, timeout=20, allow_redirects=True
++        )
++        resp.raise_for_status()
++    except requests.RequestException:
++        logger.warning("Could not fetch TikTok page for photo probe: %s", url)
++        return None
++
++    match = re.search(
++        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
++        resp.text,
++        re.DOTALL,
++    )
++    if not match:
++        return None
++
++    try:
++        data = json.loads(match.group(1))
++        scope = data.get("__DEFAULT_SCOPE__", {})
++        detail = scope.get("webapp.video-detail") or scope.get("webapp.photo-detail") or {}
++        item = detail["itemInfo"]["itemStruct"]
++        images = item["imagePost"]["images"]
++    except (KeyError, TypeError, json.JSONDecodeError):
++        return None  # not a photo post, or TikTok changed the page shape
++
++    urls = []
++    for img in images:
++        url_list = (img.get("imageURL") or {}).get("urlList") or []
++        if url_list:
++            urls.append(url_list[0])  # first entry is TikTok's highest-res copy
++    return urls or None
++
++
++def download_photo_files(urls: list, out_dir: str) -> list:
++    """Downloads each slideshow photo to out_dir. Skips (and logs) any single
++    photo that fails rather than failing the whole post — a 9/10 result is
++    still useful to the user."""
++    paths = []
++    for i, photo_url in enumerate(urls):
++        path = os.path.join(out_dir, f"photo_{i + 1}.jpg")
++        try:
++            r = requests.get(photo_url, headers={"User-Agent": _SCRAPE_UA}, timeout=30)
++            r.raise_for_status()
++            with open(path, "wb") as f:
++                f.write(r.content)
++            paths.append(path)
++        except requests.RequestException:
++            logger.warning("Failed to download slideshow photo %s", photo_url)
++    return paths
++
++
++def enhance_image_file(path: str):
++    """Lightweight, non-AI enhancement: mild upscale + sharpen + contrast/color
++    bump via Pillow. This is NOT AI super-resolution (that needs a model like
++    Real-ESRGAN and a GPU-capable server) — it's a fast, CPU-only pass that
++    makes compressed social-media photos look a bit crisper."""
++    img = Image.open(path).convert("RGB")
++    if config.PHOTO_ENHANCE_SCALE > 1.0:
++        new_size = (
++            int(img.width * config.PHOTO_ENHANCE_SCALE),
++            int(img.height * config.PHOTO_ENHANCE_SCALE),
++        )
++        img = img.resize(new_size, Image.LANCZOS)
++    img = ImageEnhance.Sharpness(img).enhance(1.6)
++    img = ImageEnhance.Contrast(img).enhance(1.08)
++    img = ImageEnhance.Color(img).enhance(1.05)
++    img.save(path, quality=95)
++
+ 
+ def user_display_name(update: Update) -> str:
+     u = update.effective_user
+@@ -158,7 +294,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+             ]
+         ]
+     )
+-    admin_bot = Bot(token=config.ADMIN_BOT_TOKEN)
+     photo_file_id = update.message.photo[-1].file_id
+     photo_file = await context.bot.get_file(photo_file_id)
+ 
+@@ -168,7 +303,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+         for admin_id in config.ADMIN_IDS:
+             try:
+                 with open(local_path, "rb") as f:
+-                    await admin_bot.send_photo(
++                    await _admin_notify_bot.send_photo(
+                         chat_id=admin_id, photo=f, caption=caption, reply_markup=keyboard
+                     )
+             except Exception:
+@@ -265,6 +400,42 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+ 
+     url = match.group(0)
+     chat_id = update.effective_chat.id
++
++    # TikTok photo/slideshow posts aren't a "video" at all — check for that
++    # first so we can grab every photo in the post instead of forcing it
++    # through the video-quality picker.
++    if TIKTOK_HOST_RE.search(url):
++        probe_msg = await update.message.reply_text(t(lang, "downloading"))
++        try:
++            photo_urls = await run_limited_with_retry(fetch_tiktok_photo_urls, url)
++        except asyncio.TimeoutError:
++            photo_urls = None
++        except Exception:
++            logger.exception("Photo probe failed, falling back to video flow")
++            photo_urls = None
++
++        if photo_urls:
++            pending_photo_urls[chat_id] = (url, photo_urls, user_id)
++            count = len(photo_urls)
++            plural = "" if count == 1 else "s"
++            await probe_msg.edit_text(t(lang, "photo_post_detected", count=count, plural=plural))
++            if config.ENABLE_PHOTO_ENHANCE:
++                kb = InlineKeyboardMarkup([[
++                    InlineKeyboardButton(t(lang, "enhance_yes"), callback_data="photoenh_yes"),
++                    InlineKeyboardButton(t(lang, "enhance_no"), callback_data="photoenh_no"),
++                ]])
++                await update.message.reply_text(t(lang, "photo_ask_enhance"), reply_markup=kb)
++            else:
++                await do_download_photos(probe_msg, chat_id, user_id, lang, enhance=False)
++            return
++        else:
++            # Not a photo post (or TikTok's page shape changed) — clean up
++            # the probe message and fall through to the normal video flow.
++            try:
++                await probe_msg.delete()
++            except Exception:
++                pass
++
+     pending_urls[chat_id] = url
+ 
+     # Fast path: user has a saved default quality, so skip the picker entirely.
+@@ -331,8 +502,7 @@ async def do_download(status_msg: Message, url: str, choice_key: str, user_id: i
+     with TemporaryDirectory() as tmp_dir:
+         opts = build_ydl_opts(choice_key, height, tmp_dir)
+         try:
+-            loop = asyncio.get_event_loop()
+-            filename = await loop.run_in_executor(None, _download, url, opts)
++            filename = await run_limited_with_retry(_download, url, opts)
+ 
+             if choice_key == "audio_mp3":
+                 base, _ = os.path.splitext(filename)
+@@ -364,6 +534,8 @@ async def do_download(status_msg: Message, url: str, choice_key: str, user_id: i
+             await status_msg.edit_text(
+                 t(lang, "done", remaining=new_status["remaining"], daily_limit=new_status["daily_limit"])
+             )
++        except asyncio.TimeoutError:
++            await status_msg.edit_text(t(lang, "download_timeout"))
+         except Exception as e:
+             logger.exception("Download failed")
+             await status_msg.edit_text(t(lang, "failed", error=str(e)))
+@@ -371,6 +543,80 @@ async def do_download(status_msg: Message, url: str, choice_key: str, user_id: i
+             pending_urls.pop(chat_id, None)
+ 
+ 
++async def do_download_photos(status_msg: Message, chat_id: int, user_id: int, lang: str, enhance: bool):
++    """Downloads every photo from a detected TikTok slideshow post, optionally
++    runs them through the lightweight Pillow enhancer, and sends them as one
++    or more Telegram media groups (max 10 items each)."""
++    entry = pending_photo_urls.pop(chat_id, None)
++    if not entry:
++        await status_msg.edit_text(t(lang, "link_expired"))
++        return
++    _url, photo_urls, owner_id = entry
++    if owner_id != user_id:
++        return  # someone else's pending request in this chat — ignore
++
++    s = db.get_user_status(user_id)
++    if s["remaining"] <= 0:
++        await status_msg.edit_text(t(lang, "out_of_downloads"))
++        return
++
++    with TemporaryDirectory() as tmp_dir:
++        try:
++            paths = await run_limited_with_retry(download_photo_files, photo_urls, tmp_dir)
++            if not paths:
++                raise RuntimeError("No photos could be downloaded from this post.")
++
++            if enhance:
++                for p in paths:
++                    try:
++                        enhance_image_file(p)
++                    except Exception:
++                        logger.exception("Enhance failed for %s — sending original instead", p)
++
++            count = len(paths)
++            plural = "" if count == 1 else "s"
++            await status_msg.edit_text(t(lang, "photo_sending", count=count, plural=plural))
++
++            # Telegram caps a media group (album) at 10 items, so batch it.
++            for i in range(0, count, config.MAX_MEDIA_GROUP_SIZE):
++                batch = paths[i:i + config.MAX_MEDIA_GROUP_SIZE]
++                open_files = [open(p, "rb") for p in batch]
++                try:
++                    media = [InputMediaPhoto(f) for f in open_files]
++                    await status_msg.reply_media_group(media=media)
++                finally:
++                    for f in open_files:
++                        f.close()
++
++            db.increment_download_count(user_id)
++            new_status = db.get_user_status(user_id)
++            await status_msg.edit_text(
++                t(
++                    lang,
++                    "photo_done",
++                    count=count,
++                    remaining=new_status["remaining"],
++                    daily_limit=new_status["daily_limit"],
++                )
++            )
++        except asyncio.TimeoutError:
++            await status_msg.edit_text(t(lang, "download_timeout"))
++        except Exception as e:
++            logger.exception("Photo slideshow download failed")
++            await status_msg.edit_text(t(lang, "failed", error=str(e)))
++
++
++async def photo_enhance_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
++    query = update.callback_query
++    await query.answer()
++    user_id = update.effective_user.id
++    lang = user_lang(user_id)
++    chat_id = update.effective_chat.id
++    enhance = query.data == "photoenh_yes"
++    await query.edit_message_text(t(lang, "downloading"))
++    await do_download_photos(query.message, chat_id, user_id, lang, enhance=enhance)
++
++
+ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+     query = update.callback_query
+     data = query.data
+@@ -393,8 +639,10 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
+ 
+ def main():
+     db.init_db()
+-    if config.DOWNLOAD_BOT_TOKEN == "PUT_DOWNLOAD_BOT_TOKEN_HERE":
+-        raise SystemExit("Set DOWNLOAD_BOT_TOKEN env var first.")
++    if not config.DOWNLOAD_BOT_TOKEN:
++        raise SystemExit("Set the DOWNLOAD_BOT_TOKEN env var first.")
++    if not config.ADMIN_BOT_TOKEN:
++        raise SystemExit("Set the ADMIN_BOT_TOKEN env var first (needed to relay payment proofs).")
+ 
+     app = ApplicationBuilder().token(config.DOWNLOAD_BOT_TOKEN).build()
+     app.add_handler(CommandHandler("start", start))
+@@ -405,6 +653,7 @@ def main():
+     app.add_handler(CallbackQueryHandler(language_choice, pattern=r"^lang_"))
+     app.add_handler(CallbackQueryHandler(plan_choice, pattern=r"^plan_"))
+     app.add_handler(CallbackQueryHandler(set_default_choice, pattern=r"^setdefault_"))
++    app.add_handler(CallbackQueryHandler(photo_enhance_choice, pattern=r"^photoenh_"))
+     app.add_handler(
+         CallbackQueryHandler(handle_quality_choice, pattern=r"^(video_|audio_mp3|locked_)")
+     )
+diff --git a/requirements.txt b/requirements.txt
+index edd1269..96ec8d8 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,5 @@
+ python-telegram-bot>=21.0
+ yt-dlp>=2024.7.1
+-# no other external deps — sqlite3 is in the Python standard library
++requests>=2.31.0
++Pillow>=10.0.0
++# sqlite3 is in the Python standard library (no separate install needed)
+diff --git a/strings.py b/strings.py
+index 61a4cbb..86feb5c 100644
+--- a/strings.py
++++ b/strings.py
+@@ -54,6 +54,14 @@ STRINGS = {
+         "default_quality_set": "✅ Default set to {label}. Just send a link and it'll download right away.",
+         "default_always_ask": "✅ I'll show the quality menu every time again.",
+         "always_ask_button": "🔁 Always ask me",
++        "photo_post_detected": "🖼 This is a photo post ({count} photo{plural}). Downloading all of them…",
++        "photo_ask_enhance": "Want me to sharpen/upscale these photos a bit before sending?",
++        "enhance_yes": "✨ Yes, enhance",
++        "enhance_no": "➡️ No, send as-is",
++        "photo_sending": "📤 Sending {count} photo{plural}…",
++        "photo_done": "Done ✅ — sent {count} photo{plural} ({remaining}/{daily_limit} downloads left today)",
++        "too_many_requests": "⏳ Lots of downloads running right now — yours is queued, hang tight…",
++        "download_timeout": "⏱️ That took too long and timed out. The source may be slow or blocking us — try again in a bit.",
+     },
+     "km": {
+         "welcome": (
+@@ -110,6 +118,14 @@ STRINGS = {
+         "default_quality_set": "✅ កំណត់លំនាំដើមទៅជា {label}។ គ្រាន់តែផ្ញើតំណ វានឹងទាញយកភ្លាមៗ។",
+         "default_always_ask": "✅ ខ្ញុំនឹងបង្ហាញម៉ឺនុយគុណភាពគ្រប់ពេលដដែល។",
+         "always_ask_button": "🔁 សួរខ្ញុំរាល់ពេល",
++        "photo_post_detected": "🖼 នេះជាការបង្ហោះរូបភាព ({count} រូប)។ កំពុងទាញយកទាំងអស់…",
++        "photo_ask_enhance": "តើអ្នកចង់ឲ្យខ្ញុំធ្វើឲ្យរូបភាពច្បាស់/ធំជាងមុនបន្តិចមុននឹងផ្ញើទេ?",
++        "enhance_yes": "✨ បាទ/ចាស៎ ធ្វើឲ្យប្រសើរ",
++        "enhance_no": "➡️ ទេ ផ្ញើដូចដើម",
++        "photo_sending": "📤 កំពុងផ្ញើរូបភាព {count}…",
++        "photo_done": "ធ្វើរួចរាល់ ✅ — បានផ្ញើរូបភាព {count} (នៅសល់ {remaining}/{daily_limit} ដងសម្រាប់ថ្ងៃនេះ)",
++        "too_many_requests": "⏳ ការទាញយកកំពុងដំណើរការច្រើនក្នុងពេលនេះ — សំណើររបស់អ្នកកំពុងរង់ចាំ…",
++        "download_timeout": "⏱️ ការទាញយកនេះយូរពេក ហើយត្រូវបានផ្អាក។ សូមសាកល្បងម្តងទៀតក្រោយមួយសន្ទុះ។",
+     },
+ }
+ 
