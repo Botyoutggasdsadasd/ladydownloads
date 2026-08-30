@@ -1,0 +1,9 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "railpack"
+  },
+  "deploy": {
+    "startCommand": "python run_all.py"
+  }
+}
